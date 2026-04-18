@@ -1585,3 +1585,4 @@ def criar_pagamento_checkout_compat(
 @app.post("/pagamentos/{pagamento_id}/aprovar-demo")
 def aprovar_pagamento_demo(pagamento_id: int):
     return {"ok": True, "mensagem": "Modo demo desativado. Use o link real para pagar."}
+# deploy render atualizado
