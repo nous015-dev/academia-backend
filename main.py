@@ -68,27 +68,29 @@ class ConfigDB(Base):
 
 class AlunoDB(Base):
     __tablename__ = "alunos"
+
     id = Column(Integer, primary_key=True, index=True)
     nome = Column(String, nullable=False)
     telefone = Column(String, nullable=True)
     cpf = Column(String, unique=True, nullable=False, index=True)
     email = Column(String, nullable=True)
     sexo = Column(String, nullable=True)
+
     plano_nome = Column(String, nullable=True)
     valor_plano = Column(Float, default=0.0)
     desconto_percentual = Column(Float, default=0.0)
     vencimento = Column(String, nullable=True)  # YYYY-MM-DD
-    foto_url = Column(Text, nullable=True)
+
     foto_base64 = Column(Text, nullable=True)
     data_cadastro = Column(String, nullable=True)
+
     status_cliente_raw = Column(String, nullable=True)
     status_contrato_raw = Column(String, nullable=True)
+
     valor_personalizado = Column(Float, nullable=True)
     beneficio_ativo = Column(Boolean, default=True)
     valor_padrao_plano = Column(Float, nullable=True)
     origem_valor = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
 
 class PagamentoDB(Base):
     __tablename__ = "pagamentos"
@@ -131,7 +133,7 @@ class TreinoDB(Base):
     descricao = Column(Text, nullable=True)
     exercicios = Column(Text, nullable=True)  # texto puro separado por quebras de linha
     video_url = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+
 
 class EntradaDB(Base):
     __tablename__ = "entradas"
@@ -605,20 +607,18 @@ def criar_aluno(body: AlunoCreate = Body(...)):
                 valor_plano = 0.0
 
         aluno = AlunoDB(
-            nome=payload_nome,
-            telefone=payload_telefone,
-            cpf=cpf_limpo,
-            email=payload_email,
-            sexo=payload_sexo,
-            status_manual="pendente",
-            plano_nome=plano_normalizado,
-            valor_plano=valor_plano,
-            vencimento=None,
-            data_cadastro=agora_str(),
-            status_cliente_raw="pendente",
-            status_contrato_raw="aguardando_pagamento",
-            updated_at=datetime.utcnow(),
-        )
+    nome=payload_nome,
+    telefone=payload_telefone,
+    cpf=cpf_limpo,
+    email=payload_email,
+    sexo=payload_sexo,
+    plano_nome=plano_normalizado,
+    valor_plano=valor_plano,
+    vencimento=None,
+    data_cadastro=agora_str(),
+    status_cliente_raw="pendente",
+    status_contrato_raw="aguardando_pagamento",
+)
         db.add(aluno)
         db.commit()
         db.refresh(aluno)
