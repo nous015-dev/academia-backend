@@ -74,7 +74,6 @@ class AlunoDB(Base):
     cpf = Column(String, unique=True, nullable=False, index=True)
     email = Column(String, nullable=True)
     sexo = Column(String, nullable=True)
-    status_manual = Column(String, default="pendente")  # pendente, em_dia, atrasado, inativo
     plano_nome = Column(String, nullable=True)
     valor_plano = Column(Float, default=0.0)
     desconto_percentual = Column(Float, default=0.0)
