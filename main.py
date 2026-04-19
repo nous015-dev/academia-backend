@@ -7,6 +7,7 @@ from io import BytesIO
 from typing import Optional, Literal
 
 import qrcode
+import requests
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -41,7 +42,7 @@ Base = declarative_base()
 QR_CATRACA = os.getenv("QR_CATRACA", "CATRACA_ACADEMIA_01").strip()
 ADMIN_LOGIN = os.getenv("ADMIN_LOGIN", "Coliseufit")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Coliseu_fit2026")
-INFINITEPAY_HANDLE = os.getenv("INFINITEPAY_HANDLE", "aylen-65425645-v40").strip()
+INFINITEPAY_HANDLE = os.getenv("INFINITEPAY_HANDLE", "indael").strip()
 
 PAYMENT_LINK_MENSAL = os.getenv("PAYMENT_LINK_MENSAL", "https://link.infinitepay.io/aylen-65425645-v40/VC1D-JncUSFq47-125,00").strip()
 PAYMENT_LINK_SEMESTRAL = os.getenv("PAYMENT_LINK_SEMESTRAL", "https://link.infinitepay.io/aylen-65425645-v40/VC1D-1HCUNRg7PL-720,00").strip()
@@ -53,6 +54,9 @@ SEMESTRAL_VALOR = 720.0
 ANUAL_VALOR = 1320.0
 PROMOCIONAL_VALOR_PADRAO = 80.90
 PROMOCIONAL_DIAS_PADRAO = 30
+
+INFINITEPAY_CHECKOUT_URL = "https://api.infinitepay.io/invoices/public/checkout/links"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://academia-backend-aksl.onrender.com").strip()
 
 PLANOS_FIXOS = {
     30: {"nome": "Mensal", "valor": MENSAL_VALOR},
@@ -1561,45 +1565,146 @@ def salvar_treino_compat(body: TreinoCompatCreate):
 
 @app.post("/pagamentos/criar")
 def criar_pagamento_checkout_compat(
-    body: Optional[dict] = None,
+    body: Optional[dict] = Body(default=None),
     aluno_id: Optional[int] = Query(default=None),
     dias: Optional[int] = Query(default=None),
     valor: Optional[float] = Query(default=None),
     plano_nome: Optional[str] = Query(default=None),
 ):
-    # compatível com o Flutter antigo: sempre retorna link real/stub e sem marcar pago sozinho
     payload = body or {}
     aluno_id = aluno_id or payload.get("aluno_id")
     dias = dias or payload.get("dias")
     valor = valor or payload.get("valor")
     plano_nome = plano_nome or payload.get("plano_nome")
+
     if not aluno_id:
         raise HTTPException(status_code=400, detail="aluno_id obrigatório")
+
     db = SessionLocal()
     try:
         aluno = buscar_aluno_por_id(db, int(aluno_id))
         if not aluno:
             raise HTTPException(status_code=404, detail="Aluno não encontrado")
-        plano_key = "mensal"
-        if plano_nome:
-            txt = str(plano_nome).lower()
-            if "promo" in txt:
-                plano_key = "promocional"
-            elif "anual" in txt:
-                plano_key = "anual"
-            elif "semes" in txt:
-                plano_key = "semestral"
+
+        valor_final = valor_aluno(aluno)
+        if valor is not None:
+            try:
+                valor_final = float(valor)
+            except Exception:
+                pass
+
+        descricao_plano = plano_nome or plano_nome_aluno(aluno)
+        if not descricao_plano:
+            if dias:
+                descricao_plano = "Anual" if int(dias) >= 365 else "Semestral" if int(dias) >= 180 else "Mensal"
             else:
-                plano_key = "mensal"
-        elif dias:
-            plano_key = "anual" if int(dias) >= 365 else "semestral" if int(dias) >= 180 else "mensal"
-        link = obter_link_plano(db, plano_key) or f"https://link.infinitepay.io/{INFINITEPAY_HANDLE}"
+                descricao_plano = "Mensal"
+
+        valor_centavos = max(1, int(round(float(valor_final) * 100)))
+        order_nsu = f"aluno_{aluno.id}_{int(datetime.utcnow().timestamp())}"
+
+        checkout_payload = {
+            "handle": INFINITEPAY_HANDLE,
+            "items": [
+                {
+                    "name": f"Mensalidade Coliseu Fit - {descricao_plano}",
+                    "quantity": 1,
+                    "price": valor_centavos,
+                }
+            ],
+            "order_nsu": order_nsu,
+            "redirect_url": f"{PUBLIC_BASE_URL}/",
+            "webhook_url": f"{PUBLIC_BASE_URL}/webhooks/infinitepay",
+            "customer": {
+                "name": aluno.nome or "Aluno Coliseu Fit",
+            },
+        }
+
+        if getattr(aluno, "email", None):
+            checkout_payload["customer"]["email"] = aluno.email
+        if getattr(aluno, "telefone", None):
+            checkout_payload["customer"]["phone"] = apenas_digitos(aluno.telefone)
+
+        resp = requests.post(INFINITEPAY_CHECKOUT_URL, json=checkout_payload, timeout=30)
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"InfinitePay: {resp.text}")
+
+        data = resp.json() if resp.content else {}
+        checkout_url = (
+            data.get("url")
+            or data.get("checkout_url")
+            or data.get("link")
+            or data.get("payment_url")
+            or (data.get("data") or {}).get("url")
+        )
+        if not checkout_url:
+            raise HTTPException(status_code=502, detail=f"Resposta inesperada da InfinitePay: {data}")
+
+        pagamento = PagamentoDB(
+            aluno_id=aluno.id,
+            plano=descricao_plano,
+            valor=float(valor_final),
+            link_pagamento=checkout_url,
+            observacao=f"order_nsu={order_nsu}",
+            status="pendente",
+            criado_em=agora_str(),
+        )
+        db.add(pagamento)
+        db.commit()
+        db.refresh(pagamento)
+
         return {
             "ok": True,
-            "modo": "link_real",
-            "checkout_url": link,
-            "pagamento": {"id": 0},
+            "modo": "checkout_dinamico",
+            "checkout_url": checkout_url,
+            "order_nsu": order_nsu,
+            "pagamento": pagamento_dict(pagamento),
         }
+    finally:
+        db.close()
+
+@app.post("/webhooks/infinitepay")
+def webhook_infinitepay(body: Optional[dict] = Body(default=None)):
+    payload = body or {}
+    order_nsu = (
+        payload.get("order_nsu")
+        or payload.get("orderNsu")
+        or ((payload.get("data") or {}).get("order_nsu"))
+        or ((payload.get("data") or {}).get("orderNsu"))
+    )
+    transaction_status = str(
+        payload.get("status")
+        or payload.get("payment_status")
+        or ((payload.get("data") or {}).get("status"))
+        or ""
+    ).lower()
+
+    if not order_nsu:
+        return {"ok": False, "mensagem": "order_nsu ausente"}
+
+    db = SessionLocal()
+    try:
+        pagamento = db.query(PagamentoDB).filter(PagamentoDB.observacao.contains(order_nsu)).order_by(PagamentoDB.id.desc()).first()
+        if not pagamento:
+            return {"ok": False, "mensagem": "pagamento não encontrado"}
+
+        aprovado = transaction_status in {"paid", "approved", "completed", "success", "succeeded"}
+        if not aprovado and "paid_amount" in payload:
+            try:
+                aprovado = float(payload.get("paid_amount") or 0) > 0
+            except Exception:
+                aprovado = False
+
+        if aprovado:
+            pagamento.status = "aprovado"
+            pagamento.aprovado_em = agora_str()
+            aluno = buscar_aluno_por_id(db, pagamento.aluno_id)
+            if aluno:
+                aplicar_pagamento_aluno(db, aluno, pagamento.plano, pagamento.valor, forma="InfinitePay", observacao=order_nsu)
+            db.commit()
+            return {"ok": True, "mensagem": "pagamento aprovado e aluno liberado"}
+
+        return {"ok": True, "mensagem": "webhook recebido", "status": transaction_status or "desconhecido"}
     finally:
         db.close()
 
