@@ -144,9 +144,6 @@ class EntradaDB(Base):
     data_entrada = Column(DateTime, default=datetime.utcnow)
 
 
-Base.metadata.drop_all(bind=engine)
-Base.metadata.create_all(bind=engine)
-
 def ensure_schema_updates():
     insp = inspect(engine)
     if "alunos" in insp.get_table_names():
