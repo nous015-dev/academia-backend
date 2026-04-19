@@ -66,6 +66,7 @@ class ConfigDB(Base):
     chave = Column(String, unique=True, nullable=False)
     valor = Column(Text, nullable=False)
 
+
 class AlunoDB(Base):
     __tablename__ = "alunos"
 
@@ -76,11 +77,13 @@ class AlunoDB(Base):
     email = Column(String, nullable=True)
     sexo = Column(String, nullable=True)
 
+    status_manual = Column(String, default="pendente")  # pendente / em_dia / atrasado / inativo
     plano_nome = Column(String, nullable=True)
     valor_plano = Column(Float, default=0.0)
     desconto_percentual = Column(Float, default=0.0)
     vencimento = Column(String, nullable=True)  # YYYY-MM-DD
 
+    foto_url = Column(Text, nullable=True)
     foto_base64 = Column(Text, nullable=True)
     data_cadastro = Column(String, nullable=True)
 
@@ -91,6 +94,9 @@ class AlunoDB(Base):
     beneficio_ativo = Column(Boolean, default=True)
     valor_padrao_plano = Column(Float, nullable=True)
     origem_valor = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
 
 class PagamentoDB(Base):
     __tablename__ = "pagamentos"
@@ -145,21 +151,39 @@ class EntradaDB(Base):
     data_entrada = Column(DateTime, default=datetime.utcnow)
 
 
+
 def ensure_schema_updates():
     insp = inspect(engine)
+
     if "alunos" in insp.get_table_names():
         cols = {c["name"] for c in insp.get_columns("alunos")}
         alter_cmds = []
-        if "desconto_percentual" not in cols:
-            alter_cmds.append("ALTER TABLE alunos ADD COLUMN desconto_percentual FLOAT DEFAULT 0")
-        if "valor_personalizado" not in cols:
-            alter_cmds.append("ALTER TABLE alunos ADD COLUMN valor_personalizado FLOAT")
-        if "beneficio_ativo" not in cols:
-            alter_cmds.append("ALTER TABLE alunos ADD COLUMN beneficio_ativo BOOLEAN DEFAULT 1")
-        if "valor_padrao_plano" not in cols:
-            alter_cmds.append("ALTER TABLE alunos ADD COLUMN valor_padrao_plano FLOAT")
-        if "origem_valor" not in cols:
-            alter_cmds.append("ALTER TABLE alunos ADD COLUMN origem_valor VARCHAR(50)")
+
+        expected_columns = {
+            "email": "ALTER TABLE alunos ADD COLUMN email VARCHAR(255)",
+            "sexo": "ALTER TABLE alunos ADD COLUMN sexo VARCHAR(50)",
+            "status_manual": "ALTER TABLE alunos ADD COLUMN status_manual VARCHAR(20) DEFAULT 'pendente'",
+            "plano_nome": "ALTER TABLE alunos ADD COLUMN plano_nome VARCHAR(100)",
+            "valor_plano": "ALTER TABLE alunos ADD COLUMN valor_plano FLOAT DEFAULT 0",
+            "desconto_percentual": "ALTER TABLE alunos ADD COLUMN desconto_percentual FLOAT DEFAULT 0",
+            "vencimento": "ALTER TABLE alunos ADD COLUMN vencimento VARCHAR(20)",
+            "foto_url": "ALTER TABLE alunos ADD COLUMN foto_url TEXT",
+            "foto_base64": "ALTER TABLE alunos ADD COLUMN foto_base64 TEXT",
+            "data_cadastro": "ALTER TABLE alunos ADD COLUMN data_cadastro VARCHAR(50)",
+            "status_cliente_raw": "ALTER TABLE alunos ADD COLUMN status_cliente_raw VARCHAR(50)",
+            "status_contrato_raw": "ALTER TABLE alunos ADD COLUMN status_contrato_raw VARCHAR(50)",
+            "valor_personalizado": "ALTER TABLE alunos ADD COLUMN valor_personalizado FLOAT",
+            "beneficio_ativo": "ALTER TABLE alunos ADD COLUMN beneficio_ativo BOOLEAN DEFAULT 1",
+            "valor_padrao_plano": "ALTER TABLE alunos ADD COLUMN valor_padrao_plano FLOAT",
+            "origem_valor": "ALTER TABLE alunos ADD COLUMN origem_valor VARCHAR(50)",
+            "created_at": "ALTER TABLE alunos ADD COLUMN created_at TIMESTAMP",
+            "updated_at": "ALTER TABLE alunos ADD COLUMN updated_at TIMESTAMP",
+        }
+
+        for col_name, cmd in expected_columns.items():
+            if col_name not in cols:
+                alter_cmds.append(cmd)
+
         if alter_cmds:
             with engine.begin() as conn:
                 for cmd in alter_cmds:
