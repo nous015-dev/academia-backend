@@ -158,6 +158,7 @@ class EntradaDB(Base):
 
 def ensure_schema_updates():
     insp = inspect(engine)
+    is_postgres = str(DATABASE_URL).startswith("postgres")
 
     if "alunos" in insp.get_table_names():
         cols = {c["name"] for c in insp.get_columns("alunos")}
@@ -198,15 +199,15 @@ def ensure_schema_updates():
         alter_cmds = []
 
         expected_columns = {
-            "plano_nome": "ALTER TABLE pagamentos ADD COLUMN plano_nome VARCHAR(255)",
+            "plano_nome": "ALTER TABLE pagamentos ADD COLUMN plano_nome VARCHAR(100)",
             "valor": "ALTER TABLE pagamentos ADD COLUMN valor FLOAT DEFAULT 0",
             "dias": "ALTER TABLE pagamentos ADD COLUMN dias INTEGER DEFAULT 30",
-            "status": "ALTER TABLE pagamentos ADD COLUMN status VARCHAR(50) DEFAULT 'pendente'",
+            "status": "ALTER TABLE pagamentos ADD COLUMN status VARCHAR(30) DEFAULT 'pendente'",
             "origem": "ALTER TABLE pagamentos ADD COLUMN origem VARCHAR(50) DEFAULT 'manual'",
             "link_pagamento": "ALTER TABLE pagamentos ADD COLUMN link_pagamento TEXT",
             "data_pagamento": "ALTER TABLE pagamentos ADD COLUMN data_pagamento TIMESTAMP",
-            "vencimento_anterior": "ALTER TABLE pagamentos ADD COLUMN vencimento_anterior VARCHAR(50)",
-            "novo_vencimento": "ALTER TABLE pagamentos ADD COLUMN novo_vencimento VARCHAR(50)",
+            "vencimento_anterior": "ALTER TABLE pagamentos ADD COLUMN vencimento_anterior VARCHAR(30)",
+            "novo_vencimento": "ALTER TABLE pagamentos ADD COLUMN novo_vencimento VARCHAR(30)",
         }
 
         for col_name, cmd in expected_columns.items():
@@ -217,15 +218,14 @@ def ensure_schema_updates():
             for cmd in alter_cmds:
                 conn.execute(text(cmd))
 
-            if not DATABASE_URL.startswith("sqlite"):
-                # amplia tipos antigos do banco online para evitar estouro em checkout/link
+            if is_postgres:
                 safe_alters = [
-                    "ALTER TABLE pagamentos ALTER COLUMN plano_nome TYPE TEXT",
-                    "ALTER TABLE pagamentos ALTER COLUMN status TYPE TEXT",
-                    "ALTER TABLE pagamentos ALTER COLUMN origem TYPE TEXT",
+                    "ALTER TABLE pagamentos ALTER COLUMN plano_nome TYPE VARCHAR(100)",
+                    "ALTER TABLE pagamentos ALTER COLUMN status TYPE VARCHAR(30)",
+                    "ALTER TABLE pagamentos ALTER COLUMN origem TYPE VARCHAR(50)",
                     "ALTER TABLE pagamentos ALTER COLUMN link_pagamento TYPE TEXT",
-                    "ALTER TABLE pagamentos ALTER COLUMN vencimento_anterior TYPE TEXT",
-                    "ALTER TABLE pagamentos ALTER COLUMN novo_vencimento TYPE TEXT",
+                    "ALTER TABLE pagamentos ALTER COLUMN vencimento_anterior TYPE VARCHAR(30)",
+                    "ALTER TABLE pagamentos ALTER COLUMN novo_vencimento TYPE VARCHAR(30)",
                 ]
                 for cmd in safe_alters:
                     try:
@@ -1688,9 +1688,10 @@ def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends
             "handle": INFINITEPAY_HANDLE,
             "items": [
                 {
+                    "name": f"Plano {plano_final} - Coliseu Fit",
+                    "description": f"Plano {plano_final} - {dias_final} dias",
                     "quantity": 1,
                     "price": valor_centavos,
-                    "description": f"Plano {plano_final} - {dias_final} dias",
                 }
             ],
             "order_nsu": order_nsu,
