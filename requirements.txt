@@ -1,10 +1,8 @@
-
 fastapi
 uvicorn
 sqlalchemy
-pydantic
-qrcode
-pillow
 psycopg2-binary
-pandas
+requests
+python-multipart
+pydantic
 openpyxl
