@@ -8,7 +8,7 @@ from typing import Optional, Literal
 
 import qrcode
 import requests
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException, Query, Body, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
@@ -194,6 +194,7 @@ def ensure_schema_updates():
                     conn.execute(text(cmd))
 
 ensure_schema_updates()
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
@@ -282,6 +283,12 @@ class PaymentLinksBody(BaseModel):
     anual: Optional[str] = None
     promocional: Optional[str] = None
 
+class CriarPagamentoCheckoutBody(BaseModel):
+    aluno_id: int
+    dias: Optional[int] = None
+    valor: Optional[float] = None
+    plano_nome: Optional[str] = None
+
 # ----------------------
 # Helpers
 # ----------------------
@@ -303,6 +310,9 @@ def get_db():
 
 def only_digits(value: str) -> str:
     return re.sub(r"\D", "", value or "")
+
+def apenas_digitos(value: Optional[str]) -> str:
+    return only_digits(value or "")
 
 def validar_cpf(cpf: str) -> bool:
     cpf = only_digits(cpf)
@@ -515,6 +525,47 @@ def calcular_novo_vencimento(vencimento_atual: Optional[str], dias: int) -> str:
     atual = parse_date_safe(vencimento_atual)
     base = atual if atual and atual >= hoje() else hoje()
     return (base + timedelta(days=dias)).strftime("%Y-%m-%d")
+
+def pagamento_dict(p: PagamentoDB) -> dict:
+    return {
+        "id": p.id,
+        "aluno_id": p.aluno_id,
+        "plano_nome": p.plano_nome,
+        "valor": float(p.valor or 0),
+        "dias": int(p.dias or 0),
+        "status": p.status,
+        "origem": p.origem,
+        "link_pagamento": p.link_pagamento,
+        "data_pagamento": p.data_pagamento.isoformat() if p.data_pagamento else None,
+        "vencimento_anterior": p.vencimento_anterior,
+        "novo_vencimento": p.novo_vencimento,
+    }
+
+def aplicar_pagamento_aluno(db, aluno: AlunoDB, plano_nome: str, valor: float, dias: Optional[int] = None):
+    plano_key = (plano_nome or "mensal").strip().lower()
+    if plano_key not in {"mensal", "semestral", "anual", "promocional"}:
+        nome = (plano_nome or "").strip().lower()
+        if "anual" in nome:
+            plano_key = "anual"
+        elif "sem" in nome:
+            plano_key = "semestral"
+        elif "promo" in nome:
+            plano_key = "promocional"
+        else:
+            plano_key = "mensal"
+
+    plano_info = info_plano(db, plano_key, valor_override=valor, dias_override=dias)
+    novo_vencimento = calcular_novo_vencimento(aluno.vencimento, int(plano_info["dias"]))
+
+    aluno.plano_nome = plano_info["nome"]
+    aluno.valor_padrao_plano = valor_base_plano_nome(db, plano_info["nome"])
+    aluno.valor_plano = float(valor)
+    aluno.vencimento = novo_vencimento
+    aluno.status_manual = "em_dia"
+    aluno.status_cliente_raw = "Ativo"
+    aluno.status_contrato_raw = "Ativo"
+    aluno.updated_at = datetime.utcnow()
+    return novo_vencimento
 
 def obter_link_plano(db, plano_key: str) -> Optional[str]:
     plano_key = plano_key.strip().lower()
@@ -1564,50 +1615,25 @@ def salvar_treino_compat(body: TreinoCompatCreate):
     ))
 
 @app.post("/pagamentos/criar")
-def criar_pagamento_checkout_compat(
-    body: Optional[dict] = Body(default=None),
-    aluno_id: Optional[int] = Query(default=None),
-    dias: Optional[int] = Query(default=None),
-    valor: Optional[float] = Query(default=None),
-    plano_nome: Optional[str] = Query(default=None),
-):
-    payload = body or {}
-    aluno_id = aluno_id or payload.get("aluno_id")
-    dias = dias or payload.get("dias")
-    valor = valor or payload.get("valor")
-    plano_nome = plano_nome or payload.get("plano_nome")
-
-    if not aluno_id:
-        raise HTTPException(status_code=400, detail="aluno_id obrigatório")
-
-    db = SessionLocal()
+def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends(get_db)):
     try:
-        aluno = buscar_aluno_por_id(db, int(aluno_id))
+        aluno = buscar_aluno_por_id(db, int(body.aluno_id))
         if not aluno:
             raise HTTPException(status_code=404, detail="Aluno não encontrado")
 
-        valor_final = valor_aluno(aluno)
-        if valor is not None:
-            try:
-                valor_final = float(valor)
-            except Exception:
-                pass
+        valor_final = float(body.valor) if body.valor is not None else valor_final_aluno(db, aluno)
+        valor_final = round(max(valor_final, 1.0), 2)
 
-        descricao_plano = plano_nome or plano_nome_aluno(aluno)
-        if not descricao_plano:
-            if dias:
-                descricao_plano = "Anual" if int(dias) >= 365 else "Semestral" if int(dias) >= 180 else "Mensal"
-            else:
-                descricao_plano = "Mensal"
-
-        valor_centavos = max(1, int(round(float(valor_final) * 100)))
+        dias_final = int(body.dias) if body.dias is not None else 30
+        plano_final = (body.plano_nome or aluno.plano_nome or "Mensal").strip()
+        valor_centavos = int(round(valor_final * 100))
         order_nsu = f"aluno_{aluno.id}_{int(datetime.utcnow().timestamp())}"
 
         checkout_payload = {
             "handle": INFINITEPAY_HANDLE,
             "items": [
                 {
-                    "name": f"Mensalidade Coliseu Fit - {descricao_plano}",
+                    "name": f"Plano {plano_final} - Coliseu Fit",
                     "quantity": 1,
                     "price": valor_centavos,
                 }
@@ -1615,39 +1641,42 @@ def criar_pagamento_checkout_compat(
             "order_nsu": order_nsu,
             "redirect_url": f"{PUBLIC_BASE_URL}/",
             "webhook_url": f"{PUBLIC_BASE_URL}/webhooks/infinitepay",
-            "customer": {
-                "name": aluno.nome or "Aluno Coliseu Fit",
-            },
         }
 
-        if getattr(aluno, "email", None):
-            checkout_payload["customer"]["email"] = aluno.email
-        if getattr(aluno, "telefone", None):
-            checkout_payload["customer"]["phone"] = apenas_digitos(aluno.telefone)
-
         resp = requests.post(INFINITEPAY_CHECKOUT_URL, json=checkout_payload, timeout=30)
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=502, detail=f"InfinitePay: {resp.text}")
 
-        data = resp.json() if resp.content else {}
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text}
+
+        if resp.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"InfinitePay: {data}")
+
         checkout_url = (
             data.get("url")
             or data.get("checkout_url")
             or data.get("link")
             or data.get("payment_url")
             or (data.get("data") or {}).get("url")
+            or (data.get("data") or {}).get("checkout_url")
+            or (data.get("invoice") or {}).get("url")
         )
+
         if not checkout_url:
             raise HTTPException(status_code=502, detail=f"Resposta inesperada da InfinitePay: {data}")
 
         pagamento = PagamentoDB(
             aluno_id=aluno.id,
-            plano=descricao_plano,
-            valor=float(valor_final),
-            link_pagamento=checkout_url,
-            observacao=f"order_nsu={order_nsu}",
+            plano_nome=plano_final,
+            valor=valor_final,
+            dias=dias_final,
             status="pendente",
-            criado_em=agora_str(),
+            origem="checkout_infinitepay",
+            link_pagamento=checkout_url,
+            data_pagamento=datetime.utcnow(),
+            vencimento_anterior=aluno.vencimento,
+            novo_vencimento=calcular_novo_vencimento(aluno.vencimento, dias_final),
         )
         db.add(pagamento)
         db.commit()
@@ -1660,11 +1689,14 @@ def criar_pagamento_checkout_compat(
             "order_nsu": order_nsu,
             "pagamento": pagamento_dict(pagamento),
         }
-    finally:
-        db.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/webhooks/infinitepay")
-def webhook_infinitepay(body: Optional[dict] = Body(default=None)):
+def webhook_infinitepay(body: Optional[dict] = Body(default=None), db=Depends(get_db)):
     payload = body or {}
     order_nsu = (
         payload.get("order_nsu")
@@ -1680,33 +1712,32 @@ def webhook_infinitepay(body: Optional[dict] = Body(default=None)):
     ).lower()
 
     if not order_nsu:
-        return {"ok": False, "mensagem": "order_nsu ausente"}
+        return {"ok": True, "mensagem": "webhook recebido sem order_nsu"}
 
-    db = SessionLocal()
-    try:
-        pagamento = db.query(PagamentoDB).filter(PagamentoDB.observacao.contains(order_nsu)).order_by(PagamentoDB.id.desc()).first()
-        if not pagamento:
-            return {"ok": False, "mensagem": "pagamento não encontrado"}
+    pagamento = (
+        db.query(PagamentoDB)
+        .filter(PagamentoDB.link_pagamento.isnot(None))
+        .order_by(PagamentoDB.id.desc())
+        .first()
+    )
 
-        aprovado = transaction_status in {"paid", "approved", "completed", "success", "succeeded"}
-        if not aprovado and "paid_amount" in payload:
-            try:
-                aprovado = float(payload.get("paid_amount") or 0) > 0
-            except Exception:
-                aprovado = False
+    if not pagamento:
+        return {"ok": True, "mensagem": "nenhum pagamento pendente encontrado"}
 
-        if aprovado:
-            pagamento.status = "aprovado"
-            pagamento.aprovado_em = agora_str()
-            aluno = buscar_aluno_por_id(db, pagamento.aluno_id)
-            if aluno:
-                aplicar_pagamento_aluno(db, aluno, pagamento.plano, pagamento.valor, forma="InfinitePay", observacao=order_nsu)
-            db.commit()
-            return {"ok": True, "mensagem": "pagamento aprovado e aluno liberado"}
+    aprovado = transaction_status in {"paid", "approved", "completed", "success", "succeeded"}
 
-        return {"ok": True, "mensagem": "webhook recebido", "status": transaction_status or "desconhecido"}
-    finally:
-        db.close()
+    if aprovado:
+        pagamento.status = "aprovado"
+        aluno = buscar_aluno_por_id(db, pagamento.aluno_id)
+        if aluno:
+            novo_vencimento = aplicar_pagamento_aluno(db, aluno, pagamento.plano_nome, pagamento.valor, pagamento.dias)
+            pagamento.novo_vencimento = novo_vencimento
+        db.commit()
+        db.refresh(pagamento)
+        return {"ok": True, "mensagem": "pagamento aprovado", "pagamento": pagamento_dict(pagamento)}
+
+    return {"ok": True, "mensagem": "webhook recebido", "status": transaction_status or "desconhecido"}
+
 
 @app.post("/pagamentos/{pagamento_id}/aprovar-demo")
 def aprovar_pagamento_demo(pagamento_id: int):
