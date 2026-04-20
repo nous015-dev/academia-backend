@@ -1648,9 +1648,9 @@ def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends
             "handle": INFINITEPAY_HANDLE,
             "items": [
                 {
-                    "name": f"Plano {plano_final} - Coliseu Fit",
                     "quantity": 1,
                     "price": valor_centavos,
+                    "description": f"Plano {plano_final} - {dias_final} dias - Coliseu Fit",
                 }
             ],
             "order_nsu": order_nsu,
