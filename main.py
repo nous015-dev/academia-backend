@@ -194,7 +194,22 @@ def ensure_schema_updates():
                     conn.execute(text(cmd))
 
 ensure_schema_updates()
-Base.metadata.create_all(bind=engine)
+
+def init_database():
+    insp = inspect(engine)
+    existing_tables = set(insp.get_table_names())
+    if not existing_tables:
+        Base.metadata.create_all(bind=engine)
+        return
+    # Em bancos já existentes (especialmente Postgres no Render),
+    # evitamos rodar create_all incondicionalmente para não recriar
+    # índices/tabelas que já existem e derrubar o deploy.
+    if DATABASE_URL.startswith("sqlite"):
+        missing = [table for table in Base.metadata.sorted_tables if table.name not in existing_tables]
+        if missing:
+            Base.metadata.create_all(bind=engine, tables=missing)
+
+init_database()
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
