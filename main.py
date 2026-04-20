@@ -158,10 +158,12 @@ class EntradaDB(Base):
 
 def ensure_schema_updates():
     insp = inspect(engine)
-    table_names = set(insp.get_table_names())
 
-    updates_by_table = {
-        "alunos": {
+    if "alunos" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("alunos")}
+        alter_cmds = []
+
+        expected_columns = {
             "email": "ALTER TABLE alunos ADD COLUMN email VARCHAR(255)",
             "sexo": "ALTER TABLE alunos ADD COLUMN sexo VARCHAR(50)",
             "status_manual": "ALTER TABLE alunos ADD COLUMN status_manual VARCHAR(20) DEFAULT 'pendente'",
@@ -175,49 +177,61 @@ def ensure_schema_updates():
             "status_cliente_raw": "ALTER TABLE alunos ADD COLUMN status_cliente_raw VARCHAR(50)",
             "status_contrato_raw": "ALTER TABLE alunos ADD COLUMN status_contrato_raw VARCHAR(50)",
             "valor_personalizado": "ALTER TABLE alunos ADD COLUMN valor_personalizado FLOAT",
-            "beneficio_ativo": "ALTER TABLE alunos ADD COLUMN beneficio_ativo BOOLEAN DEFAULT TRUE",
+            "beneficio_ativo": "ALTER TABLE alunos ADD COLUMN beneficio_ativo BOOLEAN DEFAULT 1",
             "valor_padrao_plano": "ALTER TABLE alunos ADD COLUMN valor_padrao_plano FLOAT",
             "origem_valor": "ALTER TABLE alunos ADD COLUMN origem_valor VARCHAR(50)",
             "created_at": "ALTER TABLE alunos ADD COLUMN created_at TIMESTAMP",
             "updated_at": "ALTER TABLE alunos ADD COLUMN updated_at TIMESTAMP",
-        },
-        "pagamentos": {
-            "plano_nome": "ALTER TABLE pagamentos ADD COLUMN plano_nome VARCHAR(100)",
+        }
+
+        for col_name, cmd in expected_columns.items():
+            if col_name not in cols:
+                alter_cmds.append(cmd)
+
+        if alter_cmds:
+            with engine.begin() as conn:
+                for cmd in alter_cmds:
+                    conn.execute(text(cmd))
+
+    if "pagamentos" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("pagamentos")}
+        alter_cmds = []
+
+        expected_columns = {
+            "plano_nome": "ALTER TABLE pagamentos ADD COLUMN plano_nome VARCHAR(255)",
             "valor": "ALTER TABLE pagamentos ADD COLUMN valor FLOAT DEFAULT 0",
             "dias": "ALTER TABLE pagamentos ADD COLUMN dias INTEGER DEFAULT 30",
-            "status": "ALTER TABLE pagamentos ADD COLUMN status VARCHAR(50) DEFAULT 'pago'",
+            "status": "ALTER TABLE pagamentos ADD COLUMN status VARCHAR(50) DEFAULT 'pendente'",
             "origem": "ALTER TABLE pagamentos ADD COLUMN origem VARCHAR(50) DEFAULT 'manual'",
             "link_pagamento": "ALTER TABLE pagamentos ADD COLUMN link_pagamento TEXT",
             "data_pagamento": "ALTER TABLE pagamentos ADD COLUMN data_pagamento TIMESTAMP",
-            "vencimento_anterior": "ALTER TABLE pagamentos ADD COLUMN vencimento_anterior VARCHAR(20)",
-            "novo_vencimento": "ALTER TABLE pagamentos ADD COLUMN novo_vencimento VARCHAR(20)",
-        },
-        "avisos": {
-            "imagem_base64": "ALTER TABLE avisos ADD COLUMN imagem_base64 TEXT",
-            "data": "ALTER TABLE avisos ADD COLUMN data TIMESTAMP",
-        },
-        "avisos_leituras": {
-            "data": "ALTER TABLE avisos_leituras ADD COLUMN data TIMESTAMP",
-            "lido": "ALTER TABLE avisos_leituras ADD COLUMN lido BOOLEAN DEFAULT TRUE",
-        },
-        "treinos": {
-            "descricao": "ALTER TABLE treinos ADD COLUMN descricao TEXT",
-            "exercicios": "ALTER TABLE treinos ADD COLUMN exercicios TEXT",
-            "video_url": "ALTER TABLE treinos ADD COLUMN video_url TEXT",
-        },
-        "entradas": {
-            "data_entrada": "ALTER TABLE entradas ADD COLUMN data_entrada TIMESTAMP",
-        },
-    }
+            "vencimento_anterior": "ALTER TABLE pagamentos ADD COLUMN vencimento_anterior VARCHAR(50)",
+            "novo_vencimento": "ALTER TABLE pagamentos ADD COLUMN novo_vencimento VARCHAR(50)",
+        }
 
-    with engine.begin() as conn:
-        for table_name, expected_columns in updates_by_table.items():
-            if table_name not in table_names:
-                continue
-            cols = {c["name"] for c in insp.get_columns(table_name)}
-            for col_name, cmd in expected_columns.items():
-                if col_name not in cols:
-                    conn.execute(text(cmd))
+        for col_name, cmd in expected_columns.items():
+            if col_name not in cols:
+                alter_cmds.append(cmd)
+
+        with engine.begin() as conn:
+            for cmd in alter_cmds:
+                conn.execute(text(cmd))
+
+            if not DATABASE_URL.startswith("sqlite"):
+                # amplia tipos antigos do banco online para evitar estouro em checkout/link
+                safe_alters = [
+                    "ALTER TABLE pagamentos ALTER COLUMN plano_nome TYPE TEXT",
+                    "ALTER TABLE pagamentos ALTER COLUMN status TYPE TEXT",
+                    "ALTER TABLE pagamentos ALTER COLUMN origem TYPE TEXT",
+                    "ALTER TABLE pagamentos ALTER COLUMN link_pagamento TYPE TEXT",
+                    "ALTER TABLE pagamentos ALTER COLUMN vencimento_anterior TYPE TEXT",
+                    "ALTER TABLE pagamentos ALTER COLUMN novo_vencimento TYPE TEXT",
+                ]
+                for cmd in safe_alters:
+                    try:
+                        conn.execute(text(cmd))
+                    except Exception:
+                        pass
 
 ensure_schema_updates()
 
@@ -1674,10 +1688,9 @@ def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends
             "handle": INFINITEPAY_HANDLE,
             "items": [
                 {
-                    "name": f"Plano {plano_final} - Coliseu Fit",
-                    "description": f"Plano {plano_final} - {dias_final} dias",
                     "quantity": 1,
                     "price": valor_centavos,
+                    "description": f"Plano {plano_final} - {dias_final} dias",
                 }
             ],
             "order_nsu": order_nsu,
@@ -1714,7 +1727,7 @@ def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends
             valor=valor_final,
             dias=dias_final,
             status="pendente",
-            origem="checkout_infinitepay",
+            origem="infinitepay",
             link_pagamento=checkout_url,
             data_pagamento=datetime.utcnow(),
             vencimento_anterior=aluno.vencimento,
