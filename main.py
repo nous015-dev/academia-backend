@@ -5,12 +5,13 @@ import re
 from datetime import date, datetime, timedelta
 from io import BytesIO
 from typing import Optional, Literal
+from urllib.parse import urlencode
 
 import qrcode
 import requests
 from fastapi import FastAPI, HTTPException, Query, Body, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     Boolean,
@@ -115,6 +116,13 @@ class PagamentoDB(Base):
     data_pagamento = Column(DateTime, default=datetime.utcnow)
     vencimento_anterior = Column(String, nullable=True)
     novo_vencimento = Column(String, nullable=True)
+    order_nsu = Column(String, nullable=True, index=True)
+    invoice_slug = Column(String, nullable=True, index=True)
+    transaction_nsu = Column(String, nullable=True, index=True)
+    receipt_url = Column(Text, nullable=True)
+    capture_method = Column(String, nullable=True)
+    paid_amount = Column(Float, nullable=True)
+    webhook_payload = Column(Text, nullable=True)
 
     aluno = relationship("AlunoDB")
 
@@ -202,12 +210,19 @@ def ensure_schema_updates():
             "plano_nome": "ALTER TABLE pagamentos ADD COLUMN plano_nome VARCHAR(100)",
             "valor": "ALTER TABLE pagamentos ADD COLUMN valor FLOAT DEFAULT 0",
             "dias": "ALTER TABLE pagamentos ADD COLUMN dias INTEGER DEFAULT 30",
-            "status": "ALTER TABLE pagamentos ADD COLUMN status VARCHAR(30) DEFAULT 'pendente'",
+            "status": "ALTER TABLE pagamentos ADD COLUMN status VARCHAR(50) DEFAULT 'pendente'",
             "origem": "ALTER TABLE pagamentos ADD COLUMN origem VARCHAR(50) DEFAULT 'manual'",
             "link_pagamento": "ALTER TABLE pagamentos ADD COLUMN link_pagamento TEXT",
             "data_pagamento": "ALTER TABLE pagamentos ADD COLUMN data_pagamento TIMESTAMP",
-            "vencimento_anterior": "ALTER TABLE pagamentos ADD COLUMN vencimento_anterior VARCHAR(30)",
-            "novo_vencimento": "ALTER TABLE pagamentos ADD COLUMN novo_vencimento VARCHAR(30)",
+            "vencimento_anterior": "ALTER TABLE pagamentos ADD COLUMN vencimento_anterior VARCHAR(50)",
+            "novo_vencimento": "ALTER TABLE pagamentos ADD COLUMN novo_vencimento VARCHAR(50)",
+            "order_nsu": "ALTER TABLE pagamentos ADD COLUMN order_nsu VARCHAR(120)",
+            "invoice_slug": "ALTER TABLE pagamentos ADD COLUMN invoice_slug VARCHAR(120)",
+            "transaction_nsu": "ALTER TABLE pagamentos ADD COLUMN transaction_nsu VARCHAR(120)",
+            "receipt_url": "ALTER TABLE pagamentos ADD COLUMN receipt_url TEXT",
+            "capture_method": "ALTER TABLE pagamentos ADD COLUMN capture_method VARCHAR(50)",
+            "paid_amount": "ALTER TABLE pagamentos ADD COLUMN paid_amount FLOAT",
+            "webhook_payload": "ALTER TABLE pagamentos ADD COLUMN webhook_payload TEXT",
         }
 
         for col_name, cmd in expected_columns.items():
@@ -221,11 +236,17 @@ def ensure_schema_updates():
             if is_postgres:
                 safe_alters = [
                     "ALTER TABLE pagamentos ALTER COLUMN plano_nome TYPE VARCHAR(100)",
-                    "ALTER TABLE pagamentos ALTER COLUMN status TYPE VARCHAR(30)",
+                    "ALTER TABLE pagamentos ALTER COLUMN status TYPE VARCHAR(50)",
                     "ALTER TABLE pagamentos ALTER COLUMN origem TYPE VARCHAR(50)",
                     "ALTER TABLE pagamentos ALTER COLUMN link_pagamento TYPE TEXT",
-                    "ALTER TABLE pagamentos ALTER COLUMN vencimento_anterior TYPE VARCHAR(30)",
-                    "ALTER TABLE pagamentos ALTER COLUMN novo_vencimento TYPE VARCHAR(30)",
+                    "ALTER TABLE pagamentos ALTER COLUMN vencimento_anterior TYPE VARCHAR(50)",
+                    "ALTER TABLE pagamentos ALTER COLUMN novo_vencimento TYPE VARCHAR(50)",
+                    "ALTER TABLE pagamentos ALTER COLUMN order_nsu TYPE VARCHAR(120)",
+                    "ALTER TABLE pagamentos ALTER COLUMN invoice_slug TYPE VARCHAR(120)",
+                    "ALTER TABLE pagamentos ALTER COLUMN transaction_nsu TYPE VARCHAR(120)",
+                    "ALTER TABLE pagamentos ALTER COLUMN receipt_url TYPE TEXT",
+                    "ALTER TABLE pagamentos ALTER COLUMN capture_method TYPE VARCHAR(50)",
+                    "ALTER TABLE pagamentos ALTER COLUMN webhook_payload TYPE TEXT",
                 ]
                 for cmd in safe_alters:
                     try:
@@ -581,6 +602,107 @@ def calcular_novo_vencimento(vencimento_atual: Optional[str], dias: int) -> str:
     base = atual if atual and atual >= hoje() else hoje()
     return (base + timedelta(days=dias)).strftime("%Y-%m-%d")
 
+def parse_paid_amount_centavos(value) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return round(float(value) / 100.0, 2)
+    except Exception:
+        return None
+
+
+def json_dumps_safe(payload: dict) -> str:
+    try:
+        import json
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        return str(payload)
+
+
+def localizar_pagamento_por_referencia(db, order_nsu: Optional[str] = None, invoice_slug: Optional[str] = None, transaction_nsu: Optional[str] = None):
+    q = db.query(PagamentoDB)
+    if order_nsu:
+        found = q.filter(PagamentoDB.order_nsu == str(order_nsu)).order_by(PagamentoDB.id.desc()).first()
+        if found:
+            return found
+    if invoice_slug:
+        found = q.filter(PagamentoDB.invoice_slug == str(invoice_slug)).order_by(PagamentoDB.id.desc()).first()
+        if found:
+            return found
+    if transaction_nsu:
+        found = q.filter(PagamentoDB.transaction_nsu == str(transaction_nsu)).order_by(PagamentoDB.id.desc()).first()
+        if found:
+            return found
+    return None
+
+
+def marcar_pagamento_como_pago(db, pagamento: PagamentoDB, *, invoice_slug: Optional[str] = None, transaction_nsu: Optional[str] = None,
+                              receipt_url: Optional[str] = None, capture_method: Optional[str] = None,
+                              paid_amount_centavos=None, webhook_payload: Optional[dict] = None):
+    if pagamento.status in {"pago", "aprovado"}:
+        if invoice_slug and not pagamento.invoice_slug:
+            pagamento.invoice_slug = str(invoice_slug)
+        if transaction_nsu and not pagamento.transaction_nsu:
+            pagamento.transaction_nsu = str(transaction_nsu)
+        if receipt_url:
+            pagamento.receipt_url = receipt_url
+        if capture_method:
+            pagamento.capture_method = capture_method
+        paid_amount = parse_paid_amount_centavos(paid_amount_centavos)
+        if paid_amount is not None:
+            pagamento.paid_amount = paid_amount
+        if webhook_payload:
+            pagamento.webhook_payload = json_dumps_safe(webhook_payload)
+        db.commit()
+        db.refresh(pagamento)
+        return pagamento
+
+    pagamento.status = "pago"
+    if invoice_slug:
+        pagamento.invoice_slug = str(invoice_slug)
+    if transaction_nsu:
+        pagamento.transaction_nsu = str(transaction_nsu)
+    if receipt_url:
+        pagamento.receipt_url = receipt_url
+    if capture_method:
+        pagamento.capture_method = capture_method
+    paid_amount = parse_paid_amount_centavos(paid_amount_centavos)
+    if paid_amount is not None:
+        pagamento.paid_amount = paid_amount
+    if webhook_payload:
+        pagamento.webhook_payload = json_dumps_safe(webhook_payload)
+
+    aluno = buscar_aluno_por_id(db, pagamento.aluno_id)
+    if aluno:
+        novo_vencimento = aplicar_pagamento_aluno(db, aluno, pagamento.plano_nome, pagamento.valor, pagamento.dias)
+        pagamento.novo_vencimento = novo_vencimento
+
+    db.commit()
+    db.refresh(pagamento)
+    return pagamento
+
+
+def infinitepay_payment_check(order_nsu: str, transaction_nsu: str, slug: str) -> dict:
+    payload = {
+        "handle": INFINITEPAY_HANDLE,
+        "order_nsu": order_nsu,
+        "transaction_nsu": transaction_nsu,
+        "slug": slug,
+    }
+    resp = requests.post(
+        "https://api.infinitepay.io/invoices/public/checkout/payment_check",
+        json=payload,
+        timeout=30,
+    )
+    try:
+        data = resp.json()
+    except Exception:
+        data = {"raw": resp.text}
+    if resp.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=f"InfinitePay payment_check: {data}")
+    return data
+
+
 def pagamento_dict(p: PagamentoDB) -> dict:
     return {
         "id": p.id,
@@ -594,6 +716,12 @@ def pagamento_dict(p: PagamentoDB) -> dict:
         "data_pagamento": p.data_pagamento.isoformat() if p.data_pagamento else None,
         "vencimento_anterior": p.vencimento_anterior,
         "novo_vencimento": p.novo_vencimento,
+        "order_nsu": p.order_nsu,
+        "invoice_slug": p.invoice_slug,
+        "transaction_nsu": p.transaction_nsu,
+        "receipt_url": p.receipt_url,
+        "capture_method": p.capture_method,
+        "paid_amount": float(p.paid_amount or 0) if p.paid_amount is not None else None,
     }
 
 def aplicar_pagamento_aluno(db, aluno: AlunoDB, plano_nome: str, valor: float, dias: Optional[int] = None):
@@ -1683,6 +1811,13 @@ def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends
         plano_final = (body.plano_nome or aluno.plano_nome or "Mensal").strip()
         valor_centavos = int(round(valor_final * 100))
         order_nsu = f"aluno_{aluno.id}_{int(datetime.utcnow().timestamp())}"
+        customer_phone = None
+        if aluno.telefone:
+            phone_digits = apenas_digitos(aluno.telefone)
+            if phone_digits:
+                if not phone_digits.startswith("55"):
+                    phone_digits = f"55{phone_digits}"
+                customer_phone = f"+{phone_digits}"
 
         checkout_payload = {
             "handle": INFINITEPAY_HANDLE,
@@ -1695,9 +1830,17 @@ def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends
                 }
             ],
             "order_nsu": order_nsu,
-            "redirect_url": f"{PUBLIC_BASE_URL}/",
+            "redirect_url": f"{PUBLIC_BASE_URL}/pagamentos/retorno",
             "webhook_url": f"{PUBLIC_BASE_URL}/webhooks/infinitepay",
         }
+        customer = {
+            "name": aluno.nome,
+            "email": aluno.email,
+            "phone_number": customer_phone,
+        }
+        customer = {k: v for k, v in customer.items() if v}
+        if customer:
+            checkout_payload["customer"] = customer
 
         resp = requests.post(INFINITEPAY_CHECKOUT_URL, json=checkout_payload, timeout=30)
 
@@ -1718,6 +1861,12 @@ def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends
             or (data.get("data") or {}).get("checkout_url")
             or (data.get("invoice") or {}).get("url")
         )
+        invoice_slug = (
+            data.get("invoice_slug")
+            or data.get("slug")
+            or (data.get("data") or {}).get("slug")
+            or (data.get("invoice") or {}).get("slug")
+        )
 
         if not checkout_url:
             raise HTTPException(status_code=502, detail=f"Resposta inesperada da InfinitePay: {data}")
@@ -1733,6 +1882,8 @@ def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends
             data_pagamento=datetime.utcnow(),
             vencimento_anterior=aluno.vencimento,
             novo_vencimento=calcular_novo_vencimento(aluno.vencimento, dias_final),
+            order_nsu=order_nsu,
+            invoice_slug=invoice_slug,
         )
         db.add(pagamento)
         db.commit()
@@ -1743,6 +1894,7 @@ def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends
             "modo": "checkout_dinamico",
             "checkout_url": checkout_url,
             "order_nsu": order_nsu,
+            "invoice_slug": invoice_slug,
             "pagamento": pagamento_dict(pagamento),
         }
     except HTTPException:
@@ -1751,48 +1903,128 @@ def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/pagamentos/retorno")
+def retorno_pagamento_checkout(
+    receipt_url: Optional[str] = Query(default=None),
+    order_nsu: Optional[str] = Query(default=None),
+    slug: Optional[str] = Query(default=None),
+    capture_method: Optional[str] = Query(default=None),
+    transaction_nsu: Optional[str] = Query(default=None),
+    db=Depends(get_db),
+):
+    pagamento = localizar_pagamento_por_referencia(db, order_nsu=order_nsu, invoice_slug=slug, transaction_nsu=transaction_nsu)
+    if pagamento:
+        if slug and not pagamento.invoice_slug:
+            pagamento.invoice_slug = slug
+        if transaction_nsu and not pagamento.transaction_nsu:
+            pagamento.transaction_nsu = transaction_nsu
+        if receipt_url:
+            pagamento.receipt_url = receipt_url
+        if capture_method:
+            pagamento.capture_method = capture_method
+        db.commit()
+
+        if order_nsu and slug and transaction_nsu:
+            try:
+                status_data = infinitepay_payment_check(order_nsu=order_nsu, transaction_nsu=transaction_nsu, slug=slug)
+                if status_data.get("paid") is True:
+                    pagamento = marcar_pagamento_como_pago(
+                        db,
+                        pagamento,
+                        invoice_slug=slug,
+                        transaction_nsu=transaction_nsu,
+                        receipt_url=receipt_url,
+                        capture_method=status_data.get("capture_method") or capture_method,
+                        paid_amount_centavos=status_data.get("paid_amount"),
+                        webhook_payload=status_data,
+                    )
+            except Exception:
+                pass
+
+    params = {"status": "ok"}
+    if order_nsu:
+        params["order_nsu"] = order_nsu
+    if pagamento:
+        params["pagamento_id"] = str(pagamento.id)
+    return RedirectResponse(url=f"{PUBLIC_BASE_URL}/?{urlencode(params)}", status_code=302)
+
+
 @app.post("/webhooks/infinitepay")
 def webhook_infinitepay(body: Optional[dict] = Body(default=None), db=Depends(get_db)):
     payload = body or {}
-    order_nsu = (
-        payload.get("order_nsu")
-        or payload.get("orderNsu")
-        or ((payload.get("data") or {}).get("order_nsu"))
-        or ((payload.get("data") or {}).get("orderNsu"))
-    )
-    transaction_status = str(
-        payload.get("status")
-        or payload.get("payment_status")
-        or ((payload.get("data") or {}).get("status"))
-        or ""
-    ).lower()
+    data = payload.get("data") or {}
+    order_nsu = payload.get("order_nsu") or payload.get("orderNsu") or data.get("order_nsu") or data.get("orderNsu")
+    invoice_slug = payload.get("invoice_slug") or payload.get("invoiceSlug") or payload.get("slug") or data.get("invoice_slug") or data.get("invoiceSlug") or data.get("slug")
+    transaction_nsu = payload.get("transaction_nsu") or payload.get("transactionNsu") or data.get("transaction_nsu") or data.get("transactionNsu")
+    receipt_url = payload.get("receipt_url") or payload.get("receiptUrl") or data.get("receipt_url") or data.get("receiptUrl")
+    capture_method = payload.get("capture_method") or payload.get("captureMethod") or data.get("capture_method") or data.get("captureMethod")
+    status_raw = str(payload.get("status") or payload.get("payment_status") or data.get("status") or data.get("payment_status") or "").lower()
 
-    if not order_nsu:
-        return {"ok": True, "mensagem": "webhook recebido sem order_nsu"}
-
-    pagamento = (
-        db.query(PagamentoDB)
-        .filter(PagamentoDB.link_pagamento.isnot(None))
-        .order_by(PagamentoDB.id.desc())
-        .first()
+    pagamento = localizar_pagamento_por_referencia(
+        db,
+        order_nsu=order_nsu,
+        invoice_slug=invoice_slug,
+        transaction_nsu=transaction_nsu,
     )
 
     if not pagamento:
-        return {"ok": True, "mensagem": "nenhum pagamento pendente encontrado"}
+        return {"ok": True, "mensagem": "webhook recebido sem pagamento correspondente", "order_nsu": order_nsu}
 
-    aprovado = transaction_status in {"paid", "approved", "completed", "success", "succeeded"}
+    aprovado = (
+        status_raw in {"paid", "approved", "completed", "success", "succeeded"}
+        or bool(transaction_nsu)
+        or bool(receipt_url)
+    )
 
     if aprovado:
-        pagamento.status = "aprovado"
-        aluno = buscar_aluno_por_id(db, pagamento.aluno_id)
-        if aluno:
-            novo_vencimento = aplicar_pagamento_aluno(db, aluno, pagamento.plano_nome, pagamento.valor, pagamento.dias)
-            pagamento.novo_vencimento = novo_vencimento
-        db.commit()
-        db.refresh(pagamento)
+        pagamento = marcar_pagamento_como_pago(
+            db,
+            pagamento,
+            invoice_slug=invoice_slug,
+            transaction_nsu=transaction_nsu,
+            receipt_url=receipt_url,
+            capture_method=capture_method,
+            paid_amount_centavos=payload.get("paid_amount") or data.get("paid_amount"),
+            webhook_payload=payload,
+        )
         return {"ok": True, "mensagem": "pagamento aprovado", "pagamento": pagamento_dict(pagamento)}
 
-    return {"ok": True, "mensagem": "webhook recebido", "status": transaction_status or "desconhecido"}
+    pagamento.webhook_payload = json_dumps_safe(payload)
+    if invoice_slug and not pagamento.invoice_slug:
+        pagamento.invoice_slug = str(invoice_slug)
+    if transaction_nsu and not pagamento.transaction_nsu:
+        pagamento.transaction_nsu = str(transaction_nsu)
+    if capture_method and not pagamento.capture_method:
+        pagamento.capture_method = str(capture_method)
+    db.commit()
+    return {"ok": True, "mensagem": "webhook recebido", "status": status_raw or "desconhecido"}
+
+
+@app.post("/pagamentos/{pagamento_id}/status-check")
+def consultar_status_pagamento_checkout(pagamento_id: int, db=Depends(get_db)):
+    pagamento = db.query(PagamentoDB).filter(PagamentoDB.id == pagamento_id).first()
+    if not pagamento:
+        raise HTTPException(status_code=404, detail="Pagamento não encontrado")
+    if not pagamento.order_nsu or not pagamento.transaction_nsu or not pagamento.invoice_slug:
+        raise HTTPException(status_code=400, detail="Pagamento ainda não tem referências suficientes para consulta")
+
+    status_data = infinitepay_payment_check(
+        order_nsu=pagamento.order_nsu,
+        transaction_nsu=pagamento.transaction_nsu,
+        slug=pagamento.invoice_slug,
+    )
+    if status_data.get("paid") is True:
+        pagamento = marcar_pagamento_como_pago(
+            db,
+            pagamento,
+            invoice_slug=pagamento.invoice_slug,
+            transaction_nsu=pagamento.transaction_nsu,
+            receipt_url=pagamento.receipt_url,
+            capture_method=status_data.get("capture_method") or pagamento.capture_method,
+            paid_amount_centavos=status_data.get("paid_amount"),
+            webhook_payload=status_data,
+        )
+    return {"ok": True, "status_check": status_data, "pagamento": pagamento_dict(pagamento)}
 
 
 @app.post("/pagamentos/{pagamento_id}/aprovar-demo")
