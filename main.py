@@ -60,7 +60,7 @@ INFINITEPAY_CHECKOUT_URL = "https://api.infinitepay.io/invoices/public/checkout/
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://academia-backend-aksl.onrender.com").strip()
 
 TEST_CHECKOUT_ALUNO_ID = int(os.getenv("TEST_CHECKOUT_ALUNO_ID", "359"))
-TEST_CHECKOUT_PLANO = os.getenv("TEST_CHECKOUT_PLANO", "TESTE").strip().upper()
+TEST_CHECKOUT_PLANO = os.getenv("TEST_CHECKOUT_PLANO", "PROMOCIONAL").strip().upper()
 TEST_CHECKOUT_VALOR = float(os.getenv("TEST_CHECKOUT_VALOR", "1.0"))
 
 PLANOS_FIXOS = {
