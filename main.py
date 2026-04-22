@@ -59,6 +59,10 @@ PROMOCIONAL_DIAS_PADRAO = 30
 INFINITEPAY_CHECKOUT_URL = "https://api.infinitepay.io/invoices/public/checkout/links"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://academia-backend-aksl.onrender.com").strip()
 
+TEST_CHECKOUT_ALUNO_ID = int(os.getenv("TEST_CHECKOUT_ALUNO_ID", "359"))
+TEST_CHECKOUT_PLANO = os.getenv("TEST_CHECKOUT_PLANO", "TESTE").strip().upper()
+TEST_CHECKOUT_VALOR = float(os.getenv("TEST_CHECKOUT_VALOR", "1.0"))
+
 PLANOS_FIXOS = {
     30: {"nome": "Mensal", "valor": MENSAL_VALOR},
     180: {"nome": "Semestral", "valor": SEMESTRAL_VALOR},
@@ -1805,10 +1809,15 @@ def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends
             raise HTTPException(status_code=404, detail="Aluno não encontrado")
 
         valor_final = float(body.valor) if body.valor is not None else valor_final_aluno(db, aluno)
-        valor_final = round(max(valor_final, 1.0), 2)
 
         dias_final = int(body.dias) if body.dias is not None else 30
         plano_final = (body.plano_nome or aluno.plano_nome or "Mensal").strip()
+
+        plano_teste = plano_final.upper() == TEST_CHECKOUT_PLANO
+        if aluno.id == TEST_CHECKOUT_ALUNO_ID and plano_teste:
+            valor_final = TEST_CHECKOUT_VALOR
+
+        valor_final = round(max(valor_final, 1.0), 2)
         valor_centavos = int(round(valor_final * 100))
         order_nsu = f"aluno_{aluno.id}_{int(datetime.utcnow().timestamp())}"
         customer_phone = None
