@@ -59,8 +59,8 @@ PROMOCIONAL_DIAS_PADRAO = 30
 INFINITEPAY_CHECKOUT_URL = "https://api.infinitepay.io/invoices/public/checkout/links"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://academia-backend-aksl.onrender.com").strip()
 
-TEST_CHECKOUT_ALUNO_ID = int(os.getenv("TEST_CHECKOUT_ALUNO_ID", "359"))
-TEST_CHECKOUT_PLANO = os.getenv("TEST_CHECKOUT_PLANO", "PROMOCIONAL").strip().upper()
+TEST_CHECKOUT_ALUNO_ID = int(os.getenv("TEST_CHECKOUT_ALUNO_ID", "-1"))
+TEST_CHECKOUT_PLANO = os.getenv("TEST_CHECKOUT_PLANO", "").strip().upper()
 TEST_CHECKOUT_VALOR = float(os.getenv("TEST_CHECKOUT_VALOR", "1.0"))
 
 PLANOS_FIXOS = {
@@ -533,8 +533,6 @@ def valor_mensal_real_aluno(db, aluno: AlunoDB) -> float:
 
 def valor_checkout_plano_aluno(db, aluno: AlunoDB, plano_nome: Optional[str] = None) -> float:
     plano_key = normalizar_plano_checkout(plano_nome or aluno.plano_nome)
-    if plano_key == "promocional":
-        return round(float(get_config(db, "promocional_valor", str(PROMOCIONAL_VALOR_PADRAO))), 2)
 
     mensal_real = valor_mensal_real_aluno(db, aluno)
     if plano_key == "semestral":
@@ -1770,8 +1768,6 @@ def regularizar_aluno_compat(aluno_id: int, dias: int = Query(...), valor: float
         plano = "anual"
     elif dias >= 180:
         plano = "semestral"
-    elif dias >= 30 and valor < MENSAL_VALOR:
-        plano = "promocional"
     elif dias >= 30:
         plano = "mensal"
     return registrar_pagamento(aluno_id, PagamentoBody(plano=plano, valor=valor, dias=dias, origem="manual"))
