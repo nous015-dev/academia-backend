@@ -509,30 +509,55 @@ def beneficio_ativo_aluno(aluno: AlunoDB) -> bool:
     return bool(aluno.beneficio_ativo) and obter_status_por_regras(aluno) != "inativo"
 
 
-def valor_cobrado_aluno(db, aluno: AlunoDB, plano_nome: Optional[str] = None) -> float:
-    plano_ref = plano_nome or aluno.plano_nome
-    valor_padrao = float(aluno.valor_padrao_plano or 0) or valor_base_plano_nome(db, plano_ref)
-    valor_personalizado = float(aluno.valor_personalizado or 0)
-    if beneficio_ativo_aluno(aluno) and valor_personalizado > 0:
-        return round(valor_personalizado, 2)
+def normalizar_plano_checkout(plano_nome: Optional[str]) -> str:
+    nome = (plano_nome or "Mensal").strip().lower()
+    if "promo" in nome:
+        return "promocional"
+    if "anual" in nome:
+        return "anual"
+    if "sem" in nome:
+        return "semestral"
+    return "mensal"
 
-    base = float(aluno.valor_plano or 0) or valor_padrao
+
+def valor_mensal_real_aluno(db, aluno: AlunoDB) -> float:
+    base = float(aluno.valor_personalizado or 0)
+    if base <= 0:
+        base = float(aluno.valor_padrao_plano or 0)
+    if base <= 0:
+        base = valor_base_plano_nome(db, "Mensal")
     desconto = float(aluno.desconto_percentual or 0)
     desconto = max(0.0, min(100.0, desconto))
     return round(base * (1 - desconto / 100.0), 2)
 
 
+def valor_checkout_plano_aluno(db, aluno: AlunoDB, plano_nome: Optional[str] = None) -> float:
+    plano_key = normalizar_plano_checkout(plano_nome or aluno.plano_nome)
+    if plano_key == "promocional":
+        return round(float(get_config(db, "promocional_valor", str(PROMOCIONAL_VALOR_PADRAO))), 2)
+
+    mensal_real = valor_mensal_real_aluno(db, aluno)
+    if plano_key == "semestral":
+        return round(mensal_real * 6, 2)
+    if plano_key == "anual":
+        return round(mensal_real * 12, 2)
+    return mensal_real
+
+
+def valor_cobrado_aluno(db, aluno: AlunoDB, plano_nome: Optional[str] = None) -> float:
+    return valor_checkout_plano_aluno(db, aluno, plano_nome or aluno.plano_nome)
+
+
 def desconto_percentual_real(db, aluno: AlunoDB, plano_nome: Optional[str] = None) -> float:
-    plano_ref = plano_nome or aluno.plano_nome
-    valor_padrao = float(aluno.valor_padrao_plano or 0) or valor_base_plano_nome(db, plano_ref)
-    valor_real = valor_cobrado_aluno(db, aluno, plano_ref)
+    valor_padrao = float(aluno.valor_padrao_plano or 0) or valor_base_plano_nome(db, "Mensal")
+    valor_real = valor_mensal_real_aluno(db, aluno)
     if valor_padrao <= 0 or valor_real >= valor_padrao:
         return float(aluno.desconto_percentual or 0)
     return round(((valor_padrao - valor_real) / valor_padrao) * 100.0, 2)
 
 
 def valor_final_aluno(db, aluno: AlunoDB) -> float:
-    return valor_cobrado_aluno(db, aluno, aluno.plano_nome)
+    return valor_mensal_real_aluno(db, aluno)
 
 
 def aluno_dict(db, aluno: AlunoDB) -> dict:
@@ -1808,12 +1833,14 @@ def criar_pagamento_checkout_compat(body: CriarPagamentoCheckoutBody, db=Depends
         if not aluno:
             raise HTTPException(status_code=404, detail="Aluno não encontrado")
 
-        valor_final = float(body.valor) if body.valor is not None else valor_final_aluno(db, aluno)
-
-        dias_final = int(body.dias) if body.dias is not None else 30
         plano_final = (body.plano_nome or aluno.plano_nome or "Mensal").strip()
+        plano_key = normalizar_plano_checkout(plano_final)
+        plano_info = info_plano(db, plano_key)
+        dias_final = int(body.dias) if body.dias is not None else int(plano_info["dias"])
 
-        plano_teste = plano_final.upper() == TEST_CHECKOUT_PLANO
+        valor_final = valor_checkout_plano_aluno(db, aluno, plano_final)
+
+        plano_teste = plano_key.upper() == TEST_CHECKOUT_PLANO
         if aluno.id == TEST_CHECKOUT_ALUNO_ID and plano_teste:
             valor_final = TEST_CHECKOUT_VALOR
 
