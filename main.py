@@ -86,6 +86,7 @@ class AlunoDB(Base):
     email = Column(String, nullable=True)
     sexo = Column(String, nullable=True)
 
+    status = Column(String, default="pendente")
     status_manual = Column(String, default="pendente")  # pendente / em_dia / atrasado / inativo
     plano_nome = Column(String, nullable=True)
     valor_plano = Column(Float, default=0.0)
@@ -179,6 +180,7 @@ def ensure_schema_updates():
         expected_columns = {
             "email": "ALTER TABLE alunos ADD COLUMN email VARCHAR(255)",
             "sexo": "ALTER TABLE alunos ADD COLUMN sexo VARCHAR(50)",
+            "status": "ALTER TABLE alunos ADD COLUMN status VARCHAR(20) DEFAULT 'pendente'",
             "status_manual": "ALTER TABLE alunos ADD COLUMN status_manual VARCHAR(20) DEFAULT 'pendente'",
             "plano_nome": "ALTER TABLE alunos ADD COLUMN plano_nome VARCHAR(100)",
             "valor_plano": "ALTER TABLE alunos ADD COLUMN valor_plano FLOAT DEFAULT 0",
@@ -423,20 +425,54 @@ def dias_atraso(vencimento: Optional[str]) -> int:
         return 0
     return (hoje() - venc).days
 
+
+def dias_restantes(vencimento: Optional[str]) -> Optional[int]:
+    venc = parse_date_safe(vencimento)
+    if not venc:
+        return None
+    return (venc - hoje()).days
+
+
+def status_raw_indica_inativo(value: Optional[str]) -> bool:
+    s = (value or "").strip().lower()
+    if not s:
+        return False
+    sinais = [
+        "inativo", "inativa", "encerrado", "encerrada", "cancelado", "cancelada",
+        "desligado", "desligada", "bloqueado", "bloqueada", "finalizado", "finalizada",
+    ]
+    return any(token in s for token in sinais)
+
+
 def obter_status_por_regras(aluno: AlunoDB) -> str:
     manual = (aluno.status_manual or "").strip().lower()
+    status_db = (getattr(aluno, "status", None) or "").strip().lower()
 
-    # cadastro novo sem pagamento inicial
-    if manual == "pendente" or not aluno.vencimento:
+    if status_raw_indica_inativo(aluno.status_cliente_raw) or status_raw_indica_inativo(aluno.status_contrato_raw):
+        return "inativo"
+    if manual == "inativo" or status_raw_indica_inativo(status_db):
+        return "inativo"
+
+    if not aluno.vencimento:
         return "pendente"
 
     atraso = dias_atraso(aluno.vencimento)
-
     if atraso <= 0:
         return "em_dia"
     if atraso > 30:
         return "inativo"
     return "atrasado"
+
+
+def sincronizar_status_aluno(aluno: AlunoDB) -> str:
+    status_calculado = obter_status_por_regras(aluno)
+    try:
+        aluno.status = status_calculado
+    except Exception:
+        pass
+    if status_calculado == "inativo":
+        aluno.beneficio_ativo = False
+    return status_calculado
 
 def info_plano(db, plano_key: str, valor_override: Optional[float] = None, dias_override: Optional[int] = None):
     plano_key = (plano_key or "").strip().lower()
@@ -521,9 +557,12 @@ def normalizar_plano_checkout(plano_nome: Optional[str]) -> str:
 
 
 def valor_mensal_real_aluno(db, aluno: AlunoDB) -> float:
-    base = float(aluno.valor_personalizado or 0)
+    usar_personalizado = beneficio_ativo_aluno(aluno)
+    base = float(aluno.valor_personalizado or 0) if usar_personalizado else 0.0
     if base <= 0:
         base = float(aluno.valor_padrao_plano or 0)
+    if base <= 0:
+        base = float(aluno.valor_plano or 0)
     if base <= 0:
         base = valor_base_plano_nome(db, "Mensal")
     desconto = float(aluno.desconto_percentual or 0)
@@ -559,10 +598,12 @@ def valor_final_aluno(db, aluno: AlunoDB) -> float:
 
 
 def aluno_dict(db, aluno: AlunoDB) -> dict:
-    status = obter_status_por_regras(aluno)
+    status = sincronizar_status_aluno(aluno)
     valor_padrao = float(aluno.valor_padrao_plano or 0) or valor_base_plano_nome(db, aluno.plano_nome)
     valor_personalizado = float(aluno.valor_personalizado or 0)
     beneficio_ativo = beneficio_ativo_aluno(aluno)
+    atraso = dias_atraso(aluno.vencimento)
+    restantes = dias_restantes(aluno.vencimento)
     return {
         "id": aluno.id,
         "nome": aluno.nome,
@@ -573,6 +614,7 @@ def aluno_dict(db, aluno: AlunoDB) -> dict:
         "status": status,
         "status_manual": aluno.status_manual,
         "plano_nome": aluno.plano_nome,
+        "plano_atual": aluno.plano_nome or "Mensal",
         "valor_plano": float(aluno.valor_plano or 0),
         "valor_padrao_plano": valor_padrao,
         "valor_personalizado": valor_personalizado if valor_personalizado > 0 else None,
@@ -581,6 +623,9 @@ def aluno_dict(db, aluno: AlunoDB) -> dict:
         "desconto_percentual": desconto_percentual_real(db, aluno),
         "valor_final": valor_final_aluno(db, aluno),
         "vencimento": aluno.vencimento,
+        "dias_atraso": atraso if atraso > 0 else 0,
+        "dias_restantes": restantes if restantes is not None else None,
+        "dias_para_inativar": max(0, 30 - atraso) if atraso > 0 else 30,
         "foto_url": aluno.foto_url,
         "foto_base64": aluno.foto_base64,
         "data_cadastro": aluno.data_cadastro,
@@ -772,6 +817,7 @@ def aplicar_pagamento_aluno(db, aluno: AlunoDB, plano_nome: str, valor: float, d
     aluno.valor_plano = float(valor)
     aluno.vencimento = novo_vencimento
     aluno.status_manual = "em_dia"
+    aluno.status = "em_dia"
     aluno.status_cliente_raw = "Ativo"
     aluno.status_contrato_raw = "Ativo"
     aluno.updated_at = datetime.utcnow()
@@ -905,6 +951,7 @@ def criar_aluno(body: AlunoCreate = Body(...)):
     valor_plano=valor_plano,
     vencimento=None,
     data_cadastro=agora_str(),
+    status="pendente",
     status_cliente_raw="pendente",
     status_contrato_raw="aguardando_pagamento",
 )
@@ -925,6 +972,7 @@ def criar_aluno(body: AlunoCreate = Body(...)):
 def listar_alunos(
     status: Optional[str] = Query(default=None),
     busca: Optional[str] = Query(default=None),
+    plano: Optional[str] = Query(default=None),
 ):
     db = SessionLocal()
     try:
@@ -934,6 +982,10 @@ def listar_alunos(
         if status:
             status = status.strip().lower()
             resultado = [a for a in resultado if a["status"] == status]
+
+        if plano:
+            p = plano.strip().lower()
+            resultado = [a for a in resultado if p in (a.get("plano_nome") or "").lower()]
 
         if busca:
             b = busca.strip().lower()
@@ -1100,7 +1152,9 @@ def registrar_pagamento(aluno_id: int, body: PagamentoBody):
         aluno.plano_nome = plano["nome"]
         aluno.valor_padrao_plano = valor_base_plano_nome(db, plano["nome"])
         if not beneficio_ativo_aluno(aluno):
+            aluno.beneficio_ativo = False
             aluno.valor_personalizado = None
+            aluno.origem_valor = "padrao"
         aluno.valor_plano = valor_cobrado_aluno(db, aluno, plano["nome"])
         aluno.vencimento = novo_vencimento
         aluno.status_manual = "em_dia"
@@ -1479,8 +1533,8 @@ def relatorio_resumo():
         inativos = [a for a in lista if a["status"] == "inativo"]
         pendentes = [a for a in lista if a["status"] == "pendente"]
 
-        potencial_atrasados = sum(float(a.get("valor_plano") or 0) for a in atrasados)
-        faturamento_real = sum(float(a.get("valor_plano") or 0) for a in em_dia)
+        potencial_atrasados = sum(float(a.get("valor_final") or a.get("valor_plano") or 0) for a in atrasados)
+        faturamento_real = sum(float(a.get("valor_final") or a.get("valor_plano") or 0) for a in em_dia)
 
         return {
             "total_alunos": len(lista),
