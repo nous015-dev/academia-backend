@@ -149,11 +149,33 @@ class EntradaDB(Base):
     __tablename__ = "entradas"
     id = Column(Integer, primary_key=True, index=True)
     aluno_id = Column(Integer, ForeignKey("alunos.id"), nullable=False, index=True)
-    nome = Column(String, nullable=False)
-    status = Column(String, nullable=False)  # liberado / bloqueado
-    motivo = Column(String, nullable=False)
+    nome = Column(Text, nullable=False)
+    status = Column(Text, nullable=False)  # liberado / bloqueado
+    motivo = Column(Text, nullable=False)
     data_entrada = Column(DateTime, default=datetime.utcnow)
 
+
+class LiberacaoCatracaDB(Base):
+    __tablename__ = "liberacoes_catraca"
+
+    id = Column(Integer, primary_key=True, index=True)
+    aluno_id = Column(Integer, ForeignKey("alunos.id"), nullable=False, index=True)
+    cpf = Column(Text, nullable=True)
+    nome = Column(Text, nullable=True)
+
+    status = Column(Text, default="pendente", index=True)
+    # pendente | em_execucao | executado | erro | negado
+
+    segundos = Column(Integer, default=5)
+    sentido = Column(Text, default="ambos")
+    motivo = Column(Text, nullable=True)
+    erro = Column(Text, nullable=True)
+
+    criado_em = Column(DateTime, default=datetime.utcnow)
+    executado_em = Column(DateTime, nullable=True)
+    atualizado_em = Column(DateTime, default=datetime.utcnow)
+
+    aluno = relationship("AlunoDB")
 
 
 def ensure_schema_updates():
@@ -233,36 +255,34 @@ def ensure_schema_updates():
                     except Exception:
                         pass
 
-    if "avisos" in insp.get_table_names():
-        cols = {c["name"] for c in insp.get_columns("avisos")}
-        alter_cmds = []
-
-        expected_columns = {
-            "titulo": "ALTER TABLE avisos ADD COLUMN titulo TEXT",
-            "mensagem": "ALTER TABLE avisos ADD COLUMN mensagem TEXT",
-            "imagem_base64": "ALTER TABLE avisos ADD COLUMN imagem_base64 TEXT",
-            "data": "ALTER TABLE avisos ADD COLUMN data TIMESTAMP",
-        }
-
-        for col_name, cmd in expected_columns.items():
-            if col_name not in cols:
-                alter_cmds.append(cmd)
-
+    # Ajustes da tabela de entradas: evita erro de varchar(16) em motivo/status/nome.
+    if "entradas" in insp.get_table_names():
         with engine.begin() as conn:
-            for cmd in alter_cmds:
-                try:
-                    conn.execute(text(cmd))
-                except Exception:
-                    pass
-
             if is_postgres:
-                safe_alters = [
-                    "ALTER TABLE avisos ALTER COLUMN titulo TYPE TEXT",
-                    "ALTER TABLE avisos ALTER COLUMN mensagem TYPE TEXT",
-                    "ALTER TABLE avisos ALTER COLUMN imagem_base64 TYPE TEXT",
-                    "ALTER TABLE avisos ALTER COLUMN data TYPE TIMESTAMP USING data::timestamp",
-                ]
-                for cmd in safe_alters:
+                for cmd in [
+                    "ALTER TABLE public.entradas ALTER COLUMN nome TYPE TEXT",
+                    "ALTER TABLE public.entradas ALTER COLUMN status TYPE TEXT",
+                    "ALTER TABLE public.entradas ALTER COLUMN motivo TYPE TEXT",
+                ]:
+                    try:
+                        conn.execute(text(cmd))
+                    except Exception:
+                        pass
+
+    # Cria/ajusta tabela usada pelo agente local da catraca Henry.
+    if "liberacoes_catraca" not in insp.get_table_names():
+        LiberacaoCatracaDB.__table__.create(bind=engine, checkfirst=True)
+    else:
+        if is_postgres:
+            with engine.begin() as conn:
+                for cmd in [
+                    "ALTER TABLE public.liberacoes_catraca ALTER COLUMN cpf TYPE TEXT",
+                    "ALTER TABLE public.liberacoes_catraca ALTER COLUMN nome TYPE TEXT",
+                    "ALTER TABLE public.liberacoes_catraca ALTER COLUMN status TYPE TEXT",
+                    "ALTER TABLE public.liberacoes_catraca ALTER COLUMN sentido TYPE TEXT",
+                    "ALTER TABLE public.liberacoes_catraca ALTER COLUMN motivo TYPE TEXT",
+                    "ALTER TABLE public.liberacoes_catraca ALTER COLUMN erro TYPE TEXT",
+                ]:
                     try:
                         conn.execute(text(cmd))
                     except Exception:
@@ -276,13 +296,13 @@ def init_database():
     if not existing_tables:
         Base.metadata.create_all(bind=engine)
         return
-    # Em bancos já existentes (especialmente Postgres no Render),
-    # evitamos rodar create_all incondicionalmente para não recriar
-    # índices/tabelas que já existem e derrubar o deploy.
-    if DATABASE_URL.startswith("sqlite"):
-        missing = [table for table in Base.metadata.sorted_tables if table.name not in existing_tables]
-        if missing:
-            Base.metadata.create_all(bind=engine, tables=missing)
+
+    # Banco já existente: NÃO chamamos Base.metadata.create_all para tabelas antigas,
+    # porque o PostgreSQL pode tentar recriar índices já existentes
+    # (ex.: ix_treinos_aluno_id).
+    # As migrações necessárias para entradas/liberacoes_catraca já foram feitas
+    # em ensure_schema_updates().
+    return
 
 init_database()
 
@@ -565,7 +585,7 @@ def aluno_dict(db, aluno: AlunoDB) -> dict:
         "valor_personalizado": valor_personalizado if valor_personalizado > 0 else None,
         "beneficio_ativo": beneficio_ativo,
         "origem_valor": aluno.origem_valor,
-        "desconto_percentual": float(aluno.desconto_percentual or 0),
+        "desconto_percentual": desconto_percentual_real(db, aluno),
         "valor_final": valor_final_aluno(db, aluno),
         "vencimento": aluno.vencimento,
         "foto_url": aluno.foto_url,
@@ -900,12 +920,14 @@ def atualizar_desconto_aluno(aluno_id: int, body: DescontoBody):
         aluno = buscar_aluno_por_id(db, aluno_id)
         if not aluno:
             raise HTTPException(status_code=404, detail="Aluno não encontrado")
-        aluno.desconto_percentual = max(0.0, min(100.0, float(body.desconto_percentual or 0)))
-        # O desconto salvo pelo admin deve ser respeitado exatamente.
-        # Ao alterar o desconto, limpamos o valor_personalizado para evitar
-        # recalcular/descontar duas vezes no app e no backend.
-        aluno.valor_personalizado = None
-        aluno.beneficio_ativo = True
+        aluno.desconto_percentual = float(body.desconto_percentual or 0)
+        valor_padrao = float(aluno.valor_padrao_plano or aluno.valor_plano or valor_base_plano_nome(db, aluno.plano_nome))
+        if body.desconto_percentual and body.desconto_percentual > 0:
+            aluno.valor_personalizado = round(valor_padrao * (1 - float(body.desconto_percentual)/100.0), 2)
+            aluno.beneficio_ativo = True
+        else:
+            aluno.valor_personalizado = None
+            aluno.beneficio_ativo = True
         aluno.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(aluno)
@@ -1095,17 +1117,10 @@ def obter_link_pagamento_aluno(aluno_id: int, plano: Optional[str] = None):
 def criar_aviso(body: AvisoCreate = Body(...)):
     db = SessionLocal()
     try:
-        titulo = (body.titulo or '').strip()
-        mensagem = (body.mensagem or '').strip()
-        imagem_base64 = (body.imagem_base64 or body.image_base64 or '').strip() or None
-        if not titulo:
-            raise HTTPException(status_code=400, detail='Título obrigatório')
-        if not mensagem and not imagem_base64:
-            raise HTTPException(status_code=400, detail='Mensagem ou imagem obrigatória')
         aviso = AvisoDB(
-            titulo=titulo,
-            mensagem=mensagem,
-            imagem_base64=imagem_base64,
+            titulo=body.titulo.strip(),
+            mensagem=body.mensagem.strip(),
+            imagem_base64=(body.imagem_base64 or body.image_base64),
         )
         db.add(aviso)
         db.commit()
@@ -1258,12 +1273,206 @@ def excluir_treino(treino_id: int):
     finally:
         db.close()
 
+
+def aluno_pode_liberar_catraca(aluno: AlunoDB) -> tuple[bool, str]:
+    if not aluno:
+        return False, "Aluno não encontrado"
+
+    status = obter_status_por_regras(aluno)
+    if status == "em_dia":
+        return True, "Aluno liberado"
+    if status == "atrasado":
+        return False, "Aluno atrasado. Regularize o pagamento."
+    if status == "inativo":
+        return False, "Aluno inativo. Procure a recepção."
+    if status == "pendente":
+        return False, "Aluno pendente. Regularize o cadastro/pagamento."
+    return False, f"Status não liberado: {status}"
+
+
+def registrar_evento_entrada(db, aluno: AlunoDB, status: str, motivo: str) -> None:
+    # motivo curto para manter compatibilidade mesmo se algum banco antigo ainda tiver VARCHAR(16).
+    db.add(EntradaDB(
+        aluno_id=aluno.id,
+        nome=aluno.nome or "Aluno",
+        status=(status or "liberado")[:16],
+        motivo=(motivo or "catraca")[:16],
+    ))
+
 # ----------------------
 # Acesso / Catraca
 # ----------------------
 @app.get("/catraca/qr")
 def obter_qr_catraca():
     return {"codigo": QR_CATRACA, "qr_image_base64": qrcode_base64(QR_CATRACA)}
+
+@app.post("/catraca/solicitar/{aluno_id}")
+def solicitar_liberacao_catraca(aluno_id: int):
+    """
+    Chamado pelo app do aluno.
+    Se o aluno estiver em dia, cria um pedido pendente para o agente local do PC da academia.
+    Não mexe diretamente no Henry; quem faz isso é o agente Windows.
+    """
+    db = SessionLocal()
+    try:
+        aluno = buscar_aluno_por_id(db, aluno_id)
+        if not aluno:
+            raise HTTPException(status_code=404, detail="Aluno não encontrado")
+
+        pode, mensagem = aluno_pode_liberar_catraca(aluno)
+
+        if not pode:
+            pedido = LiberacaoCatracaDB(
+                aluno_id=aluno.id,
+                cpf=aluno.cpf,
+                nome=aluno.nome,
+                status="negado",
+                segundos=5,
+                sentido="ambos",
+                motivo=mensagem,
+                atualizado_em=datetime.utcnow(),
+            )
+            db.add(pedido)
+            registrar_evento_entrada(db, aluno, "bloqueado", "catraca")
+            db.commit()
+            db.refresh(pedido)
+            return {
+                "ok": False,
+                "liberado": False,
+                "pedido_id": pedido.id,
+                "mensagem": mensagem,
+            }
+
+        # Evita acumular vários pedidos pendentes do mesmo aluno.
+        existente = (
+            db.query(LiberacaoCatracaDB)
+            .filter(
+                LiberacaoCatracaDB.aluno_id == aluno.id,
+                LiberacaoCatracaDB.status.in_(["pendente", "em_execucao"]),
+            )
+            .order_by(LiberacaoCatracaDB.criado_em.desc())
+            .first()
+        )
+        if existente:
+            return {
+                "ok": True,
+                "liberado": True,
+                "pedido_id": existente.id,
+                "mensagem": "Pedido de liberação já enviado. Aguarde a catraca.",
+            }
+
+        pedido = LiberacaoCatracaDB(
+            aluno_id=aluno.id,
+            cpf=aluno.cpf,
+            nome=aluno.nome,
+            status="pendente",
+            segundos=5,
+            sentido="ambos",
+            motivo="app",
+            atualizado_em=datetime.utcnow(),
+        )
+        db.add(pedido)
+        db.commit()
+        db.refresh(pedido)
+
+        return {
+            "ok": True,
+            "liberado": True,
+            "pedido_id": pedido.id,
+            "mensagem": "Pedido enviado. Aguarde a liberação da catraca.",
+        }
+    finally:
+        db.close()
+
+
+@app.get("/agente/catraca/pendente")
+def agente_buscar_pedido_pendente(token: str = Query(default="")):
+    token_esperado = os.getenv("AGENTE_CATRACA_TOKEN", "coliseu-agente-local-2026")
+    if token != token_esperado:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+    db = SessionLocal()
+    try:
+        pedido = (
+            db.query(LiberacaoCatracaDB)
+            .filter(LiberacaoCatracaDB.status == "pendente")
+            .order_by(LiberacaoCatracaDB.criado_em.asc())
+            .first()
+        )
+
+        if not pedido:
+            return {"ok": True, "pedido": None}
+
+        pedido.status = "em_execucao"
+        pedido.atualizado_em = datetime.utcnow()
+        db.commit()
+        db.refresh(pedido)
+
+        return {
+            "ok": True,
+            "pedido": {
+                "id": pedido.id,
+                "aluno_id": pedido.aluno_id,
+                "nome": pedido.nome,
+                "cpf": pedido.cpf,
+                "segundos": pedido.segundos or 5,
+                "sentido": pedido.sentido or "ambos",
+            },
+        }
+    finally:
+        db.close()
+
+
+def confirmar_liberacao_catraca_core(pedido_id: int, sucesso: bool, erro: str, token: str):
+    token_esperado = os.getenv("AGENTE_CATRACA_TOKEN", "coliseu-agente-local-2026")
+    if token != token_esperado:
+        raise HTTPException(status_code=401, detail="Token inválido")
+
+    db = SessionLocal()
+    try:
+        pedido = db.query(LiberacaoCatracaDB).filter(LiberacaoCatracaDB.id == pedido_id).first()
+        if not pedido:
+            raise HTTPException(status_code=404, detail="Pedido não encontrado")
+
+        if pedido.status == "executado":
+            return {"ok": True, "pedido_id": pedido.id, "status": pedido.status}
+
+        pedido.status = "executado" if sucesso else "erro"
+        pedido.erro = (erro or None)
+        pedido.executado_em = datetime.utcnow() if sucesso else None
+        pedido.atualizado_em = datetime.utcnow()
+
+        if sucesso:
+            aluno = buscar_aluno_por_id(db, pedido.aluno_id)
+            if aluno:
+                registrar_evento_entrada(db, aluno, "liberado", "catraca")
+
+        db.commit()
+        return {"ok": True, "pedido_id": pedido.id, "status": pedido.status}
+    finally:
+        db.close()
+
+
+@app.post("/agente/catraca/confirmar/{pedido_id}")
+def agente_confirmar_liberacao_post(
+    pedido_id: int,
+    sucesso: bool = Query(default=True),
+    erro: str = Query(default=""),
+    token: str = Query(default=""),
+):
+    return confirmar_liberacao_catraca_core(pedido_id, sucesso, erro, token)
+
+
+@app.get("/agente/catraca/confirmar/{pedido_id}")
+def agente_confirmar_liberacao_get(
+    pedido_id: int,
+    sucesso: bool = Query(default=True),
+    erro: str = Query(default=""),
+    token: str = Query(default=""),
+):
+    # GET facilita teste manual pelo navegador. O agente pode usar POST.
+    return confirmar_liberacao_catraca_core(pedido_id, sucesso, erro, token)
+
 
 @app.post("/entrada/{aluno_id}")
 def registrar_entrada(aluno_id: int, body: EntradaBody = Body(...)):
@@ -1281,7 +1490,7 @@ def registrar_entrada(aluno_id: int, body: EntradaBody = Body(...)):
                 aluno_id=aluno.id,
                 nome=aluno.nome,
                 status="bloqueado",
-                motivo="pagamento pendente ou status inválido",
+                motivo="pendente",
             )
             db.add(item)
             db.commit()
@@ -1310,7 +1519,7 @@ def registrar_entrada(aluno_id: int, body: EntradaBody = Body(...)):
             aluno_id=aluno.id,
             nome=aluno.nome,
             status="liberado",
-            motivo="entrada autorizada",
+            motivo="autorizada",
         )
         db.add(item)
         db.commit()
