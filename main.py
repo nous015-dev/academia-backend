@@ -1299,6 +1299,34 @@ def registrar_evento_entrada(db, aluno: AlunoDB, status: str, motivo: str) -> No
         motivo=(motivo or "catraca")[:16],
     ))
 
+
+CATRACA_PEDIDO_TIMEOUT_SECONDS = 12
+
+def reabrir_pedidos_catraca_travados(db, aluno_id: Optional[int] = None) -> int:
+    """
+    Se alguém abriu /agente/catraca/pendente no navegador ou o agente caiu no meio,
+    o pedido pode ficar preso como em_execucao. Depois de alguns segundos,
+    voltamos o pedido para pendente para o agente real conseguir pegar.
+    """
+    limite = datetime.utcnow() - timedelta(seconds=CATRACA_PEDIDO_TIMEOUT_SECONDS)
+    query = db.query(LiberacaoCatracaDB).filter(
+        LiberacaoCatracaDB.status == "em_execucao",
+        LiberacaoCatracaDB.atualizado_em < limite,
+    )
+    if aluno_id is not None:
+        query = query.filter(LiberacaoCatracaDB.aluno_id == aluno_id)
+
+    pedidos = query.all()
+    for pedido in pedidos:
+        pedido.status = "pendente"
+        pedido.motivo = "reprocessado"
+        pedido.atualizado_em = datetime.utcnow()
+
+    if pedidos:
+        db.commit()
+
+    return len(pedidos)
+
 # ----------------------
 # Acesso / Catraca
 # ----------------------
@@ -1343,6 +1371,9 @@ def solicitar_liberacao_catraca(aluno_id: int):
                 "mensagem": mensagem,
             }
 
+        # Se algum teste/navegador consumiu o pedido e ele ficou preso em execução, reabre.
+        reabrir_pedidos_catraca_travados(db, aluno.id)
+
         # Evita acumular vários pedidos pendentes do mesmo aluno.
         existente = (
             db.query(LiberacaoCatracaDB)
@@ -1354,11 +1385,16 @@ def solicitar_liberacao_catraca(aluno_id: int):
             .first()
         )
         if existente:
+            if existente.status == "em_execucao":
+                mensagem_existente = "Pedido já está em execução pelo agente. Empurre a catraca quando liberar."
+            else:
+                mensagem_existente = "Pedido de liberação enviado. Aguarde a catraca."
             return {
                 "ok": True,
                 "liberado": True,
                 "pedido_id": existente.id,
-                "mensagem": "Pedido de liberação já enviado. Aguarde a catraca.",
+                "status_pedido": existente.status,
+                "mensagem": mensagem_existente,
             }
 
         pedido = LiberacaoCatracaDB(
@@ -1379,6 +1415,7 @@ def solicitar_liberacao_catraca(aluno_id: int):
             "ok": True,
             "liberado": True,
             "pedido_id": pedido.id,
+            "status_pedido": pedido.status,
             "mensagem": "Pedido enviado. Aguarde a liberação da catraca.",
         }
     finally:
@@ -1393,6 +1430,9 @@ def agente_buscar_pedido_pendente(token: str = Query(default="")):
 
     db = SessionLocal()
     try:
+        # Reabre pedidos travados antes de buscar pendentes.
+        reabrir_pedidos_catraca_travados(db)
+
         pedido = (
             db.query(LiberacaoCatracaDB)
             .filter(LiberacaoCatracaDB.status == "pendente")
